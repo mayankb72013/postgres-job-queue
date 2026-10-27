@@ -6,7 +6,5 @@ export default defineConfig({
     fileParallelism: false,
     testTimeout: 30_000,
     hookTimeout: 30_000,
-    // Temporary: remove as soon as the first real tests exist (step 2).
-    passWithNoTests: true,
   },
 });
