@@ -1,6 +1,15 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { migrate } from "../src/db.js";
-import { IdempotencyConflict, claim, enqueue, getJob } from "../src/queue.js";
+import {
+  IdempotencyConflict,
+  claim,
+  complete,
+  enqueue,
+  fail,
+  getJob,
+  release,
+  requeueDead,
+} from "../src/queue.js";
 import { newJob, pool, resetDb, row } from "./helpers.js";
 
 beforeEach(resetDb);
@@ -189,5 +198,130 @@ describe("claim", () => {
       await holder.query("ROLLBACK");
       holder.release();
     }
+  });
+});
+
+const BACKOFF = { baseSeconds: 5, maxSeconds: 300, jitterSeconds: 5 };
+const RETRYABLE = { message: "boom", retryable: true };
+
+async function claimOne(worker = "w"): Promise<string> {
+  const job = await claim(pool, worker, LEASE_SECONDS);
+  if (!job) throw new Error("expected a claimable job");
+  return job.id;
+}
+
+async function secondsUntilRunAt(id: string): Promise<number> {
+  const result = await pool.query<{ delay: number }>(
+    "SELECT extract(epoch FROM run_at - now())::float AS delay FROM jobs WHERE id = $1",
+    [id],
+  );
+  return result.rows[0]?.delay ?? Number.NaN;
+}
+
+describe("complete, fail, release, requeue", () => {
+  it("T09 only the owner can complete, and only once", async () => {
+    const { job } = await enqueue(pool, newJob());
+    await claim(pool, "A", LEASE_SECONDS);
+
+    expect(await complete(pool, job.id, "B")).toBe(false);
+    expect(await complete(pool, job.id, "A")).toBe(true);
+    expect(await complete(pool, job.id, "A")).toBe(false);
+    expect(await row(job.id)).toMatchObject({
+      status: "succeeded",
+      locked_by: null,
+      lease_expires_at: null,
+    });
+  });
+
+  it("T10 a retryable failure waits base x 2^attempts plus jitter, capped", async () => {
+    const { job } = await enqueue(pool, newJob());
+
+    for (const [attempt, expected] of [[1, 10], [2, 20], [3, 40], [4, 80]] as const) {
+      await claimOne();
+      expect(await fail(pool, job.id, "w", RETRYABLE, BACKOFF)).toBe("queued");
+
+      const stored = await row(job.id);
+      expect(stored).toMatchObject({ status: "queued", attempts: attempt, locked_by: null });
+      expect(stored.finished_at).toBeNull();
+      const delay = await secondsUntilRunAt(job.id);
+      expect(delay).toBeGreaterThan(expected - 2);
+      expect(delay).toBeLessThanOrEqual(expected + 5);
+      await pool.query("UPDATE jobs SET run_at = now() WHERE id = $1", [job.id]);
+    }
+
+    // Attempt 12 would wait 5 x 2^12 = 20,480 s without the cap.
+    await pool.query("UPDATE jobs SET run_at = now() + interval '1 hour' WHERE id = $1", [job.id]);
+    const late = await enqueue(pool, newJob({ maxAttempts: 20 }));
+    await pool.query("UPDATE jobs SET attempts = 11 WHERE id = $1", [late.job.id]);
+    expect(await claimOne()).toBe(late.job.id);
+    expect(await fail(pool, late.job.id, "w", RETRYABLE, BACKOFF)).toBe("queued");
+    const capped = await secondsUntilRunAt(late.job.id);
+    expect(capped).toBeGreaterThan(298);
+    expect(capped).toBeLessThan(306);
+  });
+
+  it("T11 failing the last attempt makes the job dead", async () => {
+    const { job } = await enqueue(pool, newJob({ maxAttempts: 1 }));
+    await claim(pool, "w", LEASE_SECONDS);
+
+    expect(await fail(pool, job.id, "w", RETRYABLE, BACKOFF)).toBe("dead");
+    const stored = await row(job.id);
+    expect(stored).toMatchObject({ status: "dead", last_error: "boom", locked_by: null });
+    expect(stored.finished_at).not.toBeNull();
+  });
+
+  it("T12 a permanent failure is dead at once", async () => {
+    const { job } = await enqueue(pool, newJob());
+    await claim(pool, "w", LEASE_SECONDS);
+
+    const outcome = await fail(pool, job.id, "w", { message: "bad", retryable: false }, BACKOFF);
+    expect(outcome).toBe("dead");
+    expect(await row(job.id)).toMatchObject({ status: "dead", attempts: 1, last_error: "bad" });
+  });
+
+  it("T12b a long error message is cut to 2,000 characters", async () => {
+    const { job } = await enqueue(pool, newJob());
+    await claim(pool, "w", LEASE_SECONDS);
+
+    await fail(pool, job.id, "w", { message: "x".repeat(5_000), retryable: true }, BACKOFF);
+    expect((await row(job.id)).last_error).toHaveLength(2_000);
+  });
+
+  it("fail by a non-owner changes nothing", async () => {
+    const { job } = await enqueue(pool, newJob());
+    await claim(pool, "A", LEASE_SECONDS);
+
+    expect(await fail(pool, job.id, "B", RETRYABLE, BACKOFF)).toBeNull();
+    expect(await row(job.id)).toMatchObject({ status: "running", locked_by: "A" });
+  });
+
+  it("T17 requeueDead only revives dead jobs", async () => {
+    const { job } = await enqueue(pool, newJob());
+    await claim(pool, "w", LEASE_SECONDS);
+    expect(await requeueDead(pool, job.id)).toBe("not_dead");
+
+    await fail(pool, job.id, "w", { message: "bad", retryable: false }, BACKOFF);
+    expect(await requeueDead(pool, job.id)).toBe("ok");
+    const stored = await row(job.id);
+    expect(stored).toMatchObject({ status: "queued", attempts: 0, last_error: null });
+    expect(stored.finished_at).toBeNull();
+
+    expect(await requeueDead(pool, "999999")).toBe("not_found");
+  });
+
+  it("T17b release puts the job back and gives the attempt back", async () => {
+    const { job } = await enqueue(pool, newJob());
+    await claim(pool, "w", LEASE_SECONDS);
+
+    expect(await release(pool, job.id, "other", "released on worker shutdown")).toBe(false);
+    expect(await release(pool, job.id, "w", "released on worker shutdown")).toBe(true);
+    expect(await row(job.id)).toMatchObject({
+      status: "queued",
+      attempts: 0,
+      locked_by: null,
+      lease_expires_at: null,
+      last_error: "released on worker shutdown",
+    });
+    expect(await claim(pool, "w2", LEASE_SECONDS)).toMatchObject({ id: job.id, attempts: 1 });
   });
 });

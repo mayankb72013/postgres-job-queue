@@ -138,3 +138,90 @@ export async function claim(
   const claimed = result.rows[0];
   return claimed ? toJob(claimed) : null;
 }
+
+// Ownership in the WHERE clause is the fence: zero rows means "discard your result".
+export async function complete(pool: pg.Pool, id: string, workerId: string): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE jobs
+     SET status = 'succeeded', locked_by = NULL, lease_expires_at = NULL,
+         finished_at = now(), updated_at = now()
+     WHERE id = $1 AND locked_by = $2 AND status = 'running'
+     RETURNING id`,
+    [id, workerId],
+  );
+  return result.rowCount === 1;
+}
+
+export type FailureInput = { message: string; retryable: boolean };
+
+export type BackoffSettings = { baseSeconds: number; maxSeconds: number; jitterSeconds: number };
+
+// Returns the new status, or null when this worker no longer owns the job.
+// `attempts` is already counted by claim, so the first retry waits base x 2, not base.
+export async function fail(
+  pool: pg.Pool,
+  id: string,
+  workerId: string,
+  error: FailureInput,
+  backoff: BackoffSettings,
+): Promise<"queued" | "dead" | null> {
+  const result = await pool.query<{ status: "queued" | "dead" }>(
+    `UPDATE jobs
+     SET status = CASE WHEN NOT $3::boolean OR attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
+         run_at = CASE WHEN NOT $3::boolean OR attempts >= max_attempts THEN run_at
+                  ELSE now() + (LEAST($5::float8 * power(2, attempts), $6::float8)
+                                + random() * $7::float8) * interval '1 second' END,
+         last_error = left($4, 2000),
+         locked_by = NULL, lease_expires_at = NULL,
+         finished_at = CASE WHEN NOT $3::boolean OR attempts >= max_attempts THEN now() ELSE NULL END,
+         updated_at = now()
+     WHERE id = $1 AND locked_by = $2 AND status = 'running'
+     RETURNING status`,
+    [
+      id,
+      workerId,
+      error.retryable,
+      error.message,
+      backoff.baseSeconds,
+      backoff.maxSeconds,
+      backoff.jitterSeconds,
+    ],
+  );
+  return result.rows[0]?.status ?? null;
+}
+
+// Being interrupted by a deploy is not the job's fault, so the attempt is given back.
+export async function release(
+  pool: pg.Pool,
+  id: string,
+  workerId: string,
+  reason: string,
+): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE jobs
+     SET status = 'queued', locked_by = NULL, lease_expires_at = NULL,
+         attempts = GREATEST(attempts - 1, 0), run_at = now(), last_error = $3, updated_at = now()
+     WHERE id = $1 AND locked_by = $2 AND status = 'running'
+     RETURNING id`,
+    [id, workerId, reason],
+  );
+  return result.rowCount === 1;
+}
+
+export async function requeueDead(
+  pool: pg.Pool,
+  id: string,
+): Promise<"ok" | "not_dead" | "not_found"> {
+  const result = await pool.query(
+    `UPDATE jobs
+     SET status = 'queued', attempts = 0, run_at = now(), last_error = NULL,
+         finished_at = NULL, updated_at = now()
+     WHERE id = $1 AND status = 'dead'
+     RETURNING id`,
+    [id],
+  );
+  if (result.rowCount === 1) return "ok";
+
+  const exists = await pool.query("SELECT 1 FROM jobs WHERE id = $1", [id]);
+  return exists.rowCount === 1 ? "not_dead" : "not_found";
+}
