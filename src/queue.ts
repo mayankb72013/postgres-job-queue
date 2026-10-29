@@ -109,3 +109,32 @@ export async function getJob(pool: pg.Pool, id: string): Promise<JobRow | null> 
   const found = result.rows[0];
   return found ? toJob(found) : null;
 }
+
+// One statement: choosing and marking happen together, so no gap exists between them.
+export async function claim(
+  pool: pg.Pool,
+  workerId: string,
+  leaseSeconds: number,
+): Promise<JobRow | null> {
+  const result = await pool.query<DbJob>(
+    `WITH next AS (
+       SELECT id FROM jobs
+       WHERE status = 'queued' AND run_at <= now()
+       ORDER BY priority DESC, run_at
+       FOR UPDATE SKIP LOCKED
+       LIMIT 1
+     )
+     UPDATE jobs
+     SET status = 'running',
+         locked_by = $1,
+         lease_expires_at = now() + make_interval(secs => $2),
+         attempts = attempts + 1,
+         updated_at = now()
+     FROM next
+     WHERE jobs.id = next.id
+     RETURNING jobs.*`,
+    [workerId, leaseSeconds],
+  );
+  const claimed = result.rows[0];
+  return claimed ? toJob(claimed) : null;
+}

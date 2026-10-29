@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { migrate } from "../src/db.js";
-import { IdempotencyConflict, enqueue, getJob } from "../src/queue.js";
+import { IdempotencyConflict, claim, enqueue, getJob } from "../src/queue.js";
 import { newJob, pool, resetDb, row } from "./helpers.js";
 
 beforeEach(resetDb);
@@ -106,5 +106,88 @@ describe("enqueue", () => {
     expect(a.job.id).not.toBe(b.job.id);
     expect(await countRows()).toBe(2);
     expect((await row(a.job.id)).idempotency_key).toBeNull();
+  });
+});
+
+const LEASE_SECONDS = 30;
+
+describe("claim", () => {
+  it("T06 highest priority first, then oldest; an empty queue returns nothing", async () => {
+    const low = await enqueue(pool, newJob({ priority: 0, runAt: "2020-01-01T00:00:00Z" }));
+    const newest = await enqueue(pool, newJob({ priority: 5, runAt: "2020-01-03T00:00:00Z" }));
+    const older = await enqueue(pool, newJob({ priority: 5, runAt: "2020-01-02T00:00:00Z" }));
+
+    const order: (string | undefined)[] = [];
+    for (let i = 0; i < 4; i++) order.push((await claim(pool, "w", LEASE_SECONDS))?.id);
+
+    expect(order).toEqual([older.job.id, newest.job.id, low.job.id, undefined]);
+  });
+
+  it("T07 a job with a future runAt is not claimable until it is due", async () => {
+    const { job } = await enqueue(pool, newJob());
+    // The database clock decides both sides of the comparison, so the test sets run_at in SQL.
+    await pool.query("UPDATE jobs SET run_at = now() + interval '1.5 seconds' WHERE id = $1", [
+      job.id,
+    ]);
+
+    expect(await claim(pool, "w", LEASE_SECONDS)).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 1_700));
+    expect((await claim(pool, "w", LEASE_SECONDS))?.id).toBe(job.id);
+  });
+
+  it("T08 100 jobs and 8 concurrent claimers: each job is claimed exactly once", async () => {
+    for (let i = 0; i < 100; i++) await enqueue(pool, newJob());
+
+    const claimer = async (name: string): Promise<string[]> => {
+      const ids: string[] = [];
+      while (true) {
+        const job = await claim(pool, name, LEASE_SECONDS);
+        if (!job) return ids;
+        ids.push(job.id);
+      }
+    };
+    const results = await Promise.all(Array.from({ length: 8 }, (_, i) => claimer(`w${i}`)));
+    const all = results.flat();
+
+    expect(all).toHaveLength(100);
+    expect(new Set(all).size).toBe(100);
+    const wrong = await pool.query("SELECT count(*)::int AS n FROM jobs WHERE attempts <> 1");
+    expect(wrong.rows[0].n).toBe(0);
+  });
+
+  it("T08b a claimed job is running, owned, counted and leased", async () => {
+    await enqueue(pool, newJob());
+    const job = await claim(pool, "worker-a", LEASE_SECONDS);
+
+    expect(job).toMatchObject({ status: "running", lockedBy: "worker-a", attempts: 1 });
+    const result = await pool.query<{ lease_ahead: number }>(
+      "SELECT extract(epoch FROM lease_expires_at - now())::float AS lease_ahead FROM jobs WHERE id = $1",
+      [job?.id],
+    );
+    expect(result.rows[0]?.lease_ahead).toBeGreaterThan(20);
+  });
+
+  it("T08c a claim skips a row another transaction has locked instead of waiting", async () => {
+    const best = await enqueue(pool, newJob({ priority: 5 }));
+    const next = await enqueue(pool, newJob({ priority: 0 }));
+
+    const holder = await pool.connect();
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT id FROM jobs WHERE id = $1 FOR UPDATE", [best.job.id]);
+
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<"waited">((resolve) => {
+        timer = setTimeout(() => resolve("waited"), 1_500);
+      });
+      const outcome = await Promise.race([claim(pool, "w", LEASE_SECONDS), timeout]);
+      clearTimeout(timer);
+
+      expect(outcome).not.toBe("waited");
+      expect(outcome).toMatchObject({ id: next.job.id });
+    } finally {
+      await holder.query("ROLLBACK");
+      holder.release();
+    }
   });
 });
