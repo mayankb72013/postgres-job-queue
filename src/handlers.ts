@@ -8,7 +8,13 @@ export class PermanentError extends Error {
   }
 }
 
-export type HandlerContext = { signal: AbortSignal; jobId: string };
+// The worker injects workerId and recordExecution, so handlers contain no SQL.
+export type HandlerContext = {
+  signal: AbortSignal;
+  jobId: string;
+  workerId: string;
+  recordExecution: () => Promise<void>;
+};
 
 export type Handler = (payload: Record<string, unknown>, ctx: HandlerContext) => Promise<void>;
 
@@ -34,5 +40,26 @@ export const builtinHandlers: Record<string, Handler> = {
 
   permanent_fail: async () => {
     throw new PermanentError("permanent_fail handler never succeeds");
+  },
+};
+
+const durationMs = (payload: Record<string, unknown>) =>
+  typeof payload.ms === "number" && payload.ms > 0 ? payload.ms : 0;
+
+// Enabled only by TEST_HANDLERS=1, and kept out of builtinHandlers so the API never lists them.
+export const testHandlers: Record<string, Handler> = {
+  // Ignores the abort signal on purpose: it models a handler that cannot be stopped.
+  record: async (payload, { recordExecution }) => {
+    await recordExecution();
+    const ms = durationMs(payload);
+    if (ms > 0) await sleepFor(ms);
+  },
+
+  // Spins the event loop, so no timer (heartbeat included) can fire meanwhile.
+  block: async (payload) => {
+    const end = performance.now() + durationMs(payload);
+    while (performance.now() < end) {
+      // busy wait
+    }
   },
 };

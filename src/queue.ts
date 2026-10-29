@@ -109,6 +109,11 @@ export async function ping(pool: pg.Pool): Promise<void> {
   await pool.query("SELECT 1");
 }
 
+// Test-only: the `executions` table exists only in the test database.
+export async function recordExecution(pool: pg.Pool, jobId: string, workerId: string): Promise<void> {
+  await pool.query("INSERT INTO executions (job_id, worker) VALUES ($1, $2)", [jobId, workerId]);
+}
+
 export async function getJob(pool: pg.Pool, id: string): Promise<JobRow | null> {
   const result = await pool.query<DbJob>("SELECT * FROM jobs WHERE id = $1", [id]);
   const found = result.rows[0];
