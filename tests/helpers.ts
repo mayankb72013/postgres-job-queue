@@ -4,6 +4,8 @@ import { makePool, migrate } from "../src/db.js";
 export const TEST_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://jobqueue:jobqueue@localhost:5432/jobqueue_test";
 
+export const TEST_DB_PORT = Number(new URL(TEST_URL).port || 5432);
+
 export const pool = makePool(TEST_URL, 30, 10_000);
 
 // `executions` exists only in the test database; the test-only `record` handler writes to it.

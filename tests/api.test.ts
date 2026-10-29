@@ -3,7 +3,8 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { makeApp } from "../src/api.js";
 import { loadConfig } from "../src/config.js";
 import { makePool } from "../src/db.js";
-import { TEST_URL, pool, resetDb, row } from "./helpers.js";
+import { TEST_DB_PORT, TEST_URL, pool, resetDb, row, urlViaPort } from "./helpers.js";
+import { startProxy } from "./proxy.js";
 
 const config = loadConfig({ DATABASE_URL: TEST_URL, PAYLOAD_LIMIT_BYTES: 2000, LOG_LEVEL: "error" });
 const app = makeApp(pool, config);
@@ -228,6 +229,30 @@ describe("operational endpoints", () => {
       expectError(res, 503, "DB_UNAVAILABLE");
     } finally {
       await deadPool.end();
+    }
+  });
+
+  it("A18 a silent database gives 503 DB_UNAVAILABLE within 5 s, not a 500 and not a hang", async () => {
+    const proxy = await startProxy(TEST_DB_PORT);
+    const silentPool = makePool(urlViaPort(proxy.port), 2, 800, 800);
+    try {
+      const silentApp = makeApp(silentPool, config);
+      expect((await request(silentApp).get("/health")).status).toBe(200);
+
+      proxy.freeze();
+      const healthStart = performance.now();
+      const health = await request(silentApp).get("/health");
+      expect(performance.now() - healthStart).toBeLessThan(5_000);
+      expectError(health, 503, "DB_UNAVAILABLE");
+
+      const createStart = performance.now();
+      const created = await request(silentApp).post("/jobs").send({ type: "echo" });
+      expect(performance.now() - createStart).toBeLessThan(5_000);
+      expectError(created, 503, "DB_UNAVAILABLE");
+    } finally {
+      proxy.heal();
+      await silentPool.end();
+      await proxy.close();
     }
   });
 });

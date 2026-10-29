@@ -8,9 +8,12 @@ import {
   row,
   startWorker,
   stopWorker,
+  TEST_DB_PORT,
+  urlViaPort,
   waitFor,
   type WorkerProcess,
 } from "./helpers.js";
+import { startProxy, type Proxy } from "./proxy.js";
 
 // Fast settings so each test finishes in seconds.
 const FAST = {
@@ -43,9 +46,55 @@ async function executionsOf(jobId: string): Promise<string[]> {
 
 const hasExited = (child: WorkerProcess) => child.exitCode !== null || child.signalCode !== null;
 
+const proxies: Proxy[] = [];
+const supervisors: { stop: () => void }[] = [];
+
+async function proxyToDb(): Promise<Proxy> {
+  const proxy = await startProxy(TEST_DB_PORT);
+  proxies.push(proxy);
+  return proxy;
+}
+
+// Restarts a worker every time one dies, like a process manager would.
+function supervise(env: Record<string, string> = {}) {
+  let active = true;
+  let started = 0;
+  const spawnOne = () => {
+    started++;
+    worker(env).once("exit", () => {
+      if (active) spawnOne();
+    });
+  };
+  const supervisor = {
+    stop: () => {
+      active = false;
+    },
+    get started() {
+      return started;
+    },
+  };
+  supervisors.push(supervisor);
+  spawnOne();
+  return supervisor;
+}
+
+// A worker that has finished a claim round trip leaves an idle connection whose last query is the claim.
+async function hasPolled(): Promise<boolean> {
+  const r = await pool.query(
+    `SELECT count(*)::int AS n FROM pg_stat_activity
+      WHERE datname = current_database() AND state = 'idle' AND query LIKE '%SKIP LOCKED%'`,
+  );
+  return r.rows[0].n > 0;
+}
+
 // SIGKILL is the cleanup of last resort; it also covers workers a test already stopped.
-afterEach(() => {
+afterEach(async () => {
+  for (const supervisor of supervisors.splice(0)) supervisor.stop();
   for (const child of children.splice(0)) child.kill("SIGKILL");
+  for (const proxy of proxies.splice(0)) {
+    proxy.heal();
+    await proxy.close();
+  }
 });
 
 afterAll(() => pool.end());
@@ -216,4 +265,79 @@ describe("worker", () => {
     expect(mid.attempts).toBe(2);
     expect(await complete(pool, job.id, "B")).toBe(true);
   });
+
+  it("W10 a silent database makes the worker abandon its job by itself; another worker takes over", async () => {
+    const proxy = await proxyToDb();
+    const a = worker({ DATABASE_URL: urlViaPort(proxy.port), DB_QUERY_TIMEOUT_SECONDS: "1.5" });
+    const { job } = await enqueue(pool, newJob({ type: "record", payload: { ms: 9000 } }));
+    expect(await waitFor(async () => (await executionsOf(job.id)).length === 1, 15_000)).toBe(true);
+
+    // B starts only after A holds the job, and is up before the network fails.
+    const b = worker({ LOG_LEVEL: "info" });
+    expect(await waitFor(() => b.out.includes("worker.started"), 15_000)).toBe(true);
+
+    proxy.freeze();
+    const frozenAt = performance.now();
+    expect(await waitFor(() => a.out.includes("job.aborted"), 5_000)).toBe(true);
+    console.log(`W10 abort time: ${((performance.now() - frozenAt) / 1000).toFixed(1)} s`);
+
+    expect(await waitFor(async () => (await executionsOf(job.id)).length === 2, 20_000)).toBe(true);
+    expect(await waitFor(async () => (await row(job.id)).status === "succeeded", 20_000)).toBe(true);
+    expect((await row(job.id)).attempts).toBe(2);
+
+    proxy.heal();
+    stopWorker(b);
+    await exited(b);
+    const next = await enqueue(pool, newJob());
+    expect(await waitFor(async () => (await row(next.job.id)).status === "succeeded", 30_000)).toBe(true);
+  }, 90_000);
+
+  it("W11 a lost claim reply wastes one attempt but not the job", async () => {
+    const proxy = await proxyToDb();
+    const a = worker({
+      DATABASE_URL: urlViaPort(proxy.port),
+      DB_QUERY_TIMEOUT_SECONDS: "1.5",
+      // Only B may reap, so A cannot take the job again by itself.
+      REAPER_INTERVAL_SECONDS: "600",
+    });
+    expect(await waitFor(hasPolled, 15_000)).toBe(true);
+
+    proxy.dropResponses();
+    const { job } = await enqueue(pool, newJob({ type: "record" }));
+    expect(
+      await waitFor(async () => {
+        const r = await row(job.id);
+        return r.status === "running" && r.attempts === 1;
+      }, 15_000),
+    ).toBe(true);
+    expect(await waitFor(() => a.out.includes("claim.error"), 15_000)).toBe(true);
+    expect(await executionsOf(job.id)).toHaveLength(0);
+    expect((await row(job.id)).status).toBe("running");
+
+    const b = worker();
+    expect(await waitFor(async () => (await row(job.id)).status === "succeeded", 20_000)).toBe(true);
+    expect((await row(job.id)).attempts).toBe(2);
+    const runners = await executionsOf(job.id);
+    expect(runners).toHaveLength(1);
+    expect(runners[0]).toContain(`-${b.pid}-`);
+  });
+
+  it("W12 a poison job that kills every worker ends dead after maxAttempts", async () => {
+    const { job } = await enqueue(pool, newJob({ type: "crash", maxAttempts: 3 }));
+    const startedAt = performance.now();
+    const supervisor = supervise();
+    try {
+      expect(await waitFor(async () => (await row(job.id)).status === "dead", 60_000)).toBe(true);
+      console.log(
+        `W12 dead after ${((performance.now() - startedAt) / 1000).toFixed(1)} s, ${supervisor.started} processes`,
+      );
+    } finally {
+      supervisor.stop();
+    }
+
+    const final = await row(job.id);
+    expect(final.attempts).toBe(3);
+    expect(final.last_error).toContain("lease expired");
+    expect(await executionsOf(job.id)).toHaveLength(3);
+  }, 90_000);
 });

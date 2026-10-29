@@ -62,4 +62,11 @@ export const testHandlers: Record<string, Handler> = {
       // busy wait
     }
   },
+
+  // A poison job: it kills the whole process, so nobody gets to report a failure.
+  crash: async (_payload, { recordExecution }) => {
+    await recordExecution();
+    process.kill(process.pid, "SIGKILL");
+    await new Promise(() => {});
+  },
 };
