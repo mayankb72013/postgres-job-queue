@@ -8,6 +8,8 @@ import {
   fail,
   getJob,
   heartbeat,
+  listJobs,
+  metrics,
   reap,
   release,
   requeueDead,
@@ -422,5 +424,63 @@ describe("heartbeat and reap", () => {
     await expireLease(job.id);
     expect(await complete(pool, job.id, "A")).toBe(true);
     expect((await row(job.id)).status).toBe("succeeded");
+  });
+});
+
+describe("reads", () => {
+  it("T21 paging with limit and beforeId returns every row once, newest first", async () => {
+    for (let i = 0; i < 25; i++) await enqueue(pool, newJob());
+
+    const ids: string[] = [];
+    let beforeId: string | undefined;
+    while (true) {
+      const page = await listJobs(pool, { limit: 10, beforeId });
+      ids.push(...page.map((job) => job.id));
+      if (page.length < 10) break;
+      beforeId = page[page.length - 1]?.id;
+    }
+
+    expect(ids).toHaveLength(25);
+    expect(new Set(ids).size).toBe(25);
+    expect(ids).toEqual(Array.from({ length: 25 }, (_, i) => String(25 - i)));
+  });
+
+  it("T21b a status filter only returns jobs in that status", async () => {
+    const { job } = await enqueue(pool, newJob());
+    await enqueue(pool, newJob());
+    await claim(pool, "w", LEASE_SECONDS);
+    await complete(pool, job.id, "w");
+
+    const done = await listJobs(pool, { status: "succeeded", limit: 10 });
+    expect(done.map((j) => j.id)).toEqual([job.id]);
+    expect(await listJobs(pool, { status: "dead", limit: 10 })).toEqual([]);
+  });
+
+  it("T22 metrics count every status, zero-filled", async () => {
+    const { job: first } = await enqueue(pool, newJob());
+    await enqueue(pool, newJob());
+    await enqueue(pool, newJob());
+    await enqueue(pool, newJob());
+    await claim(pool, "w", LEASE_SECONDS);
+    await complete(pool, first.id, "w");
+    await claim(pool, "w", LEASE_SECONDS);
+
+    const result = await metrics(pool);
+    expect(result.counts).toEqual({ queued: 2, running: 1, succeeded: 1, dead: 0 });
+  });
+
+  it("T22b queue lag is the age of the oldest ready job; delayed jobs do not count", async () => {
+    expect((await metrics(pool)).oldestReadyAgeSeconds).toBe(0);
+
+    await enqueue(pool, newJob({ runAt: new Date(Date.now() + 3_600_000) }));
+    expect((await metrics(pool)).oldestReadyAgeSeconds).toBe(0);
+
+    const { job } = await enqueue(pool, newJob());
+    await pool.query("UPDATE jobs SET run_at = now() - interval '30 seconds' WHERE id = $1", [
+      job.id,
+    ]);
+    const lag = (await metrics(pool)).oldestReadyAgeSeconds;
+    expect(lag).toBeGreaterThanOrEqual(30);
+    expect(lag).toBeLessThan(60);
   });
 });

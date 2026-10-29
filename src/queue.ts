@@ -110,6 +110,43 @@ export async function getJob(pool: pg.Pool, id: string): Promise<JobRow | null> 
   return found ? toJob(found) : null;
 }
 
+export type ListInput = { status?: JobStatus; limit: number; beforeId?: string };
+
+// Keyset pagination: "id < last seen" stays fast on deep pages and never skips or repeats
+// rows when new jobs arrive, unlike OFFSET.
+export async function listJobs(pool: pg.Pool, input: ListInput): Promise<JobRow[]> {
+  const result = await pool.query<DbJob>(
+    `SELECT * FROM jobs
+     WHERE ($1::text IS NULL OR status = $1) AND ($2::bigint IS NULL OR id < $2)
+     ORDER BY id DESC
+     LIMIT $3`,
+    [input.status ?? null, input.beforeId ?? null, input.limit],
+  );
+  return result.rows.map(toJob);
+}
+
+export type Metrics = {
+  counts: Record<JobStatus, number>;
+  oldestReadyAgeSeconds: number;
+};
+
+// Lag counts only jobs that are due now: a delayed job is not waiting, it is scheduled.
+export async function metrics(pool: pg.Pool): Promise<Metrics> {
+  const [byStatus, lag] = await Promise.all([
+    pool.query<{ status: JobStatus; count: string }>(
+      "SELECT status, count(*) FROM jobs GROUP BY status",
+    ),
+    pool.query<{ lag: number }>(
+      `SELECT COALESCE(extract(epoch FROM now() - min(run_at)), 0)::float8 AS lag
+       FROM jobs WHERE status = 'queued' AND run_at <= now()`,
+    ),
+  ]);
+
+  const counts: Record<JobStatus, number> = { queued: 0, running: 0, succeeded: 0, dead: 0 };
+  for (const r of byStatus.rows) counts[r.status] = Number(r.count);
+  return { counts, oldestReadyAgeSeconds: lag.rows[0]?.lag ?? 0 };
+}
+
 // One statement: choosing and marking happen together, so no gap exists between them.
 export async function claim(
   pool: pg.Pool,
