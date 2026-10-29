@@ -152,6 +152,53 @@ export async function complete(pool: pg.Pool, id: string, workerId: string): Pro
   return result.rowCount === 1;
 }
 
+// False means ownership was lost. The guard is ownership, not the clock: a late heartbeat
+// still succeeds until the reaper has actually taken the job.
+export async function heartbeat(
+  pool: pg.Pool,
+  id: string,
+  workerId: string,
+  leaseSeconds: number,
+): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE jobs
+     SET lease_expires_at = now() + make_interval(secs => $3), updated_at = now()
+     WHERE id = $1 AND locked_by = $2 AND status = 'running'
+     RETURNING id`,
+    [id, workerId, leaseSeconds],
+  );
+  return result.rowCount === 1;
+}
+
+// The attempt was already counted at claim, so reap does not increment it.
+// ORDER BY id makes concurrent reapers lock rows in the same order (no deadlocks).
+export async function reap(
+  pool: pg.Pool,
+  batchSize: number,
+): Promise<{ id: string; status: "queued" | "dead" }[]> {
+  const result = await pool.query<{ id: string; status: "queued" | "dead" }>(
+    `WITH expired AS (
+       SELECT id FROM jobs
+       WHERE status = 'running' AND lease_expires_at < now()
+       ORDER BY id
+       FOR UPDATE SKIP LOCKED
+       LIMIT $1
+     )
+     UPDATE jobs j
+     SET status = CASE WHEN j.attempts >= j.max_attempts THEN 'dead' ELSE 'queued' END,
+         locked_by = NULL, lease_expires_at = NULL,
+         last_error = 'lease expired (worker presumed dead)',
+         run_at = now(),
+         finished_at = CASE WHEN j.attempts >= j.max_attempts THEN now() END,
+         updated_at = now()
+     FROM expired
+     WHERE j.id = expired.id
+     RETURNING j.id, j.status`,
+    [batchSize],
+  );
+  return result.rows;
+}
+
 export type FailureInput = { message: string; retryable: boolean };
 
 export type BackoffSettings = { baseSeconds: number; maxSeconds: number; jitterSeconds: number };

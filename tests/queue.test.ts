@@ -7,6 +7,8 @@ import {
   enqueue,
   fail,
   getJob,
+  heartbeat,
+  reap,
   release,
   requeueDead,
 } from "../src/queue.js";
@@ -323,5 +325,102 @@ describe("complete, fail, release, requeue", () => {
       last_error: "released on worker shutdown",
     });
     expect(await claim(pool, "w2", LEASE_SECONDS)).toMatchObject({ id: job.id, attempts: 1 });
+  });
+});
+
+// "Forced" means the test edits the row in SQL to simulate the passage of time.
+async function expireLease(id: string): Promise<void> {
+  await pool.query("UPDATE jobs SET lease_expires_at = now() - interval '1 minute' WHERE id = $1", [
+    id,
+  ]);
+}
+
+describe("heartbeat and reap", () => {
+  it("T13 reap requeues expired jobs, kills exhausted ones and leaves live leases alone", async () => {
+    const retry = await enqueue(pool, newJob());
+    const exhausted = await enqueue(pool, newJob({ maxAttempts: 1 }));
+    const live = await enqueue(pool, newJob());
+    for (let i = 0; i < 3; i++) await claimOne();
+    await expireLease(retry.job.id);
+    await expireLease(exhausted.job.id);
+
+    const handled = await reap(pool, 100);
+
+    expect(handled).toHaveLength(2);
+    expect(handled).toContainEqual({ id: retry.job.id, status: "queued" });
+    expect(handled).toContainEqual({ id: exhausted.job.id, status: "dead" });
+    expect(await row(retry.job.id)).toMatchObject({
+      status: "queued",
+      attempts: 1,
+      locked_by: null,
+      lease_expires_at: null,
+      last_error: "lease expired (worker presumed dead)",
+    });
+    expect((await row(retry.job.id)).finished_at).toBeNull();
+    const dead = await row(exhausted.job.id);
+    expect(dead).toMatchObject({ status: "dead", locked_by: null });
+    expect(dead.finished_at).not.toBeNull();
+    expect(await row(live.job.id)).toMatchObject({ status: "running", locked_by: "w" });
+  });
+
+  it("T14 300 expired jobs and 10 concurrent reapers: each job is handled exactly once", async () => {
+    await pool.query(
+      `INSERT INTO jobs (type, status, attempts, locked_by, lease_expires_at)
+       SELECT 'echo', 'running', 1, 'gone', now() - interval '1 minute'
+       FROM generate_series(1, 300)`,
+    );
+
+    const reaper = async (): Promise<string[]> => {
+      const ids: string[] = [];
+      while (true) {
+        const handled = await reap(pool, 50);
+        if (handled.length === 0) return ids;
+        ids.push(...handled.map((h) => h.id));
+      }
+    };
+    const results = await Promise.all(Array.from({ length: 10 }, reaper));
+    const all = results.flat();
+
+    expect(all).toHaveLength(300);
+    expect(new Set(all).size).toBe(300);
+    const left = await pool.query("SELECT count(*)::int AS n FROM jobs WHERE status = 'running'");
+    expect(left.rows[0].n).toBe(0);
+  });
+
+  it("T15 only the owner can heartbeat, and it moves the lease forward", async () => {
+    const { job } = await enqueue(pool, newJob());
+    await claim(pool, "A", LEASE_SECONDS);
+
+    expect(await heartbeat(pool, job.id, "B", 100)).toBe(false);
+    expect(await heartbeat(pool, job.id, "A", 100)).toBe(true);
+    const result = await pool.query<{ lease_ahead: number }>(
+      "SELECT extract(epoch FROM lease_expires_at - now())::float AS lease_ahead FROM jobs WHERE id = $1",
+      [job.id],
+    );
+    expect(result.rows[0]?.lease_ahead).toBeGreaterThan(90);
+  });
+
+  it("T16 a worker that lost its lease cannot complete or heartbeat the new owner's job", async () => {
+    const { job } = await enqueue(pool, newJob());
+    await claim(pool, "A", LEASE_SECONDS);
+    await expireLease(job.id);
+    expect(await reap(pool, 100)).toEqual([{ id: job.id, status: "queued" }]);
+    expect(await claim(pool, "B", LEASE_SECONDS)).toMatchObject({ id: job.id, attempts: 2 });
+
+    expect(await complete(pool, job.id, "A")).toBe(false);
+    expect(await heartbeat(pool, job.id, "A", LEASE_SECONDS)).toBe(false);
+    expect(await row(job.id)).toMatchObject({ status: "running", locked_by: "B" });
+    expect(await complete(pool, job.id, "B")).toBe(true);
+  });
+
+  it("T16b a late heartbeat or completion still works until the reaper takes the job", async () => {
+    const { job } = await enqueue(pool, newJob());
+    await claim(pool, "A", LEASE_SECONDS);
+    await expireLease(job.id);
+
+    expect(await heartbeat(pool, job.id, "A", LEASE_SECONDS)).toBe(true);
+    await expireLease(job.id);
+    expect(await complete(pool, job.id, "A")).toBe(true);
+    expect((await row(job.id)).status).toBe("succeeded");
   });
 });
