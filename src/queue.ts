@@ -104,6 +104,11 @@ export async function enqueue(
   return { job: toJob(found), created: false };
 }
 
+// Keeps the health check's SQL in this file, like every other query.
+export async function ping(pool: pg.Pool): Promise<void> {
+  await pool.query("SELECT 1");
+}
+
 export async function getJob(pool: pg.Pool, id: string): Promise<JobRow | null> {
   const result = await pool.query<DbJob>("SELECT * FROM jobs WHERE id = $1", [id]);
   const found = result.rows[0];
