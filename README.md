@@ -7,7 +7,7 @@ Jobs survive crashes, retry with exponential backoff, and are never claimed by t
 
 Requires Node 22 and Docker.
 
-    git clone <repository-url> && cd postgres-job-queue
+    git clone https://github.com/mayankb72013/postgres-job-queue.git && cd postgres-job-queue
     npm install
     cp .env.example .env
     npm run db:up        # PostgreSQL 16 in Docker
