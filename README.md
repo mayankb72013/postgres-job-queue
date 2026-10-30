@@ -21,7 +21,7 @@ Then look at the result:
     curl localhost:3000/jobs/<id>      # the id is in the response of the POST
     curl localhost:3000/metrics
 
-The npm scripts read `.env` through `node --env-file=.env`, so they behave the same on Linux and Windows.
+The npm scripts read `.env` through `node --env-file=.env`, so they need no shell-specific syntax. I have run them on Linux only.
 `npm run demo:enqueue -- 20 sleep 3000` posts twenty three-second jobs through the running API.
 
 ## What it does
@@ -225,7 +225,7 @@ The risky behaviour is tested, not just the happy path:
 - Graceful shutdown: finish the job, or release it and give the attempt back; exit code 0.
 - The constraints, idempotency under 50 simultaneous submissions, 300 expired jobs under 10 concurrent reapers, and every validation rule of the API.
 
-Mutation checks: for the four tests that prove the silent-database and poison-job protections (W10, W11, W12 and A18) I temporarily broke the matching line of code, watched the test fail, and reverted. The committed tests are unchanged.
+Mutation checks: each of the four tests that prove the silent-database and poison-job protections (W10, W11, W12 and A18) was shown to fail when the matching line of code is temporarily broken. The committed tests are unchanged.
 
 The suite passed in three consecutive runs (about 56 s each). One test sends a real SIGTERM and is skipped on Windows; the other shutdown tests use a portable `stop` message.
 
@@ -296,7 +296,7 @@ What is not built, and what is known to be limited. None of this is hidden in th
 - **Every update is a new row version, and none is HOT** (measured: 2.00 updates per job, 0 % HOT). Dead row versions accumulate until autovacuum removes them. In production, make autovacuum more aggressive on `jobs` and watch `n_dead_tup`; a long transaction anywhere in the same database blocks vacuum and slows the queue. I did not load-test vacuum behaviour.
 - **Two read queries scan the whole table.** `GET /metrics` groups all rows by status, and `GET /jobs?status=dead` can walk the primary key backwards when dead rows are old. Both grow with the table, which is another reason retention matters. I did not measure these two myself. The first fixes would be a partial index on dead jobs, counting the small statuses through the partial indexes, and not counting `succeeded` exactly.
 - **Throughput has a ceiling.** Each job costs at least two writes (claim and complete) plus one per heartbeat, each writing a row version, index entries and WAL. One well-sized server handles thousands of jobs per second, not millions. My numbers above are from one laptop with the database and the workers sharing its CPUs.
-- **Connections.** Each worker holds up to 5 database connections and the API up to 10; the total must stay under PostgreSQL's `max_connections`. A pooler such as PgBouncer in transaction mode works, because every statement is self-contained.
+- **Connections.** Each worker holds up to 5 database connections and the API up to 10; the total must stay under PostgreSQL's `max_connections`. A pooler such as PgBouncer in transaction mode should work, because every statement is self-contained; I have not tested this.
 - **Security.** No authentication. Payloads are stored in plain text and are not written to the logs. `last_error` may contain text from a handler (up to 2,000 characters). One database role does everything locally.
 - **Polling.** Idle workers poll about twice a second. `LISTEN/NOTIFY` could wake them at once, with polling kept as a fallback because notifications are not durable.
 
